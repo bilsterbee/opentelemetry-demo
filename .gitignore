@@ -10,6 +10,7 @@
 .swp
 .DS_Store
 \#*\#
+.data/
 
 docker-compose.override.yml
 

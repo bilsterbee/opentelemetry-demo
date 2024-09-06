@@ -677,6 +677,11 @@ services:
     restart: unless-stopped
     environment:
       - "GF_INSTALL_PLUGINS=grafana-opensearch-datasource"
+      ###
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor traceQLStreaming metricsSummary
     volumes:
       - ./src/grafana/grafana.ini:/etc/grafana/grafana.ini
       - ./src/grafana/provisioning/:/etc/grafana/provisioning/
@@ -705,6 +710,7 @@ services:
       - "${OTEL_COLLECTOR_PORT_HTTP}"
     depends_on:
       - jaeger
+      - tempo
     logging: *logging
     environment:
       - ENVOY_PORT
@@ -720,15 +726,20 @@ services:
     command:
       - --web.console.templates=/etc/prometheus/consoles
       - --web.console.libraries=/etc/prometheus/console_libraries
-      - --storage.tsdb.retention.time=1h
+      - --storage.tsdb.retention.time=3d
       - --config.file=/etc/prometheus/prometheus-config.yaml
       - --storage.tsdb.path=/prometheus
       - --web.enable-lifecycle
       - --web.route-prefix=/
       - --enable-feature=exemplar-storage
       - --enable-feature=otlp-write-receiver
+      ###
+      - --enable-feature=remote-write-receiver
+      - --enable-feature=native-histograms
     volumes:
       - ./src/prometheus/prometheus-config.yaml:/etc/prometheus/prometheus-config.yaml
+      ###
+      - ./.data/prometheus:/prometheus
     deploy:
       resources:
         limits:
@@ -764,4 +775,114 @@ services:
         hard: 65536
     ports:
       - "9200"
+    logging: *logging
+
+#############################################################################################################
+
+  # Tempo
+  tempo:
+    image: ${TEMPO_IMAGE}
+    container_name: tempo
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    deploy:
+      resources:
+        limits:
+          memory: 400M
+    restart: unless-stopped
+    volumes:
+      - ./src/tempo/tempo.yaml:/etc/tempo.yaml
+      - ./.data/tempo:/var/tempo
+    ports:
+      - "${TEMPO_SERVICE_PORT}" # tempo
+      - "${OTEL_COLLECTOR_PORT_GRPC}" # otlp grpc
+      - "${OTEL_COLLECTOR_PORT_HTTP}"  # otlp http
+      - "14268:14268"  # jaeger ingest
+      - "9095:9095" # tempo grpc
+      - "9411:9411"   # zipkin
+    logging: *logging
+
+  # Loki
+  loki-read:
+    image: ${LOKI_IMAGE}
+    container_name: loki-read
+    command: "-config.file=/etc/loki/config.yaml -target=read"
+    ports:
+      - 3101:3100
+      - 7946
+      - 9095
+    volumes:
+      - ./src/loki/loki.yaml:/etc/loki/config.yaml
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+    restart: unless-stopped
+    depends_on:
+      - minio
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  loki-write:
+    image: ${LOKI_IMAGE}
+    container_name: loki-write
+    command: "-config.file=/etc/loki/config.yaml -target=write"
+    ports:
+      - 3102:3100
+      - 7946
+      - 9095
+    volumes:
+      - ./src/loki/loki.yaml:/etc/loki/config.yaml
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - minio
+    logging: *logging
+
+  backend:
+    image: ${LOKI_IMAGE}
+    container_name: backend
+    volumes:
+      - ./src/loki/loki.yaml:/etc/loki/config.yaml
+    ports:
+      - "3100"
+      - "7946"
+    command: "-config.file=/etc/loki/config.yaml -target=backend -legacy-read-mode=false"
+    depends_on:
+      - minio
+    logging: *logging
+
+  # Minio
+  minio:
+    image: ${MINIO_IMAGE}
+    container_name: minio
+    entrypoint:
+      - sh
+      - -euc
+      - |
+        mkdir -p /data/loki-data && \
+        mkdir -p /data/loki-ruler && \
+        mkdir -p /data/tempo-data && \
+        minio server /data --console-address ":${MINIO_UI_PORT}"
+    environment:
+      - MINIO_ROOT_USER=loki
+      - MINIO_ROOT_PASSWORD=supersecret
+      - MINIO_PROMETHEUS_AUTH_TYPE=public
+      - MINIO_UPDATE=off
+    ports:
+      - "${MINIO_SERVICE_PORT}"
+      - "${MINIO_UI_PORT}"
+    volumes:
+      - ./.data/minio:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:${MINIO_SERVICE_PORT}/minio/health/live" ]
+      interval: 15s
+      timeout: 20s
+      retries: 5
     logging: *logging
